@@ -58,6 +58,64 @@ def prepare_dataset():
         np.save(DATASET_DIRECTORY / 'y_valid.npy', y_valid)
 
 
+def objective(trial):
+    """Objective function to make optimization for Optuna.
+
+    Args:
+        trial: optuna.trial.Trial
+    Returns:
+        loss: float
+            Loss value for the trial
+    """
+
+    # Generate model
+    classifier = generate_model(trial)
+
+    # Create dataset
+    x_train = np.load(DATASET_DIRECTORY / 'x_train.npy')
+    y_train = np.load(DATASET_DIRECTORY / 'y_train.npy')
+    x_valid = np.load(DATASET_DIRECTORY / 'x_valid.npy')
+    y_valid = np.load(DATASET_DIRECTORY / 'y_valid.npy')
+
+    # Prepare training
+    train_iter = ch.iterators.SerialIterator(
+        ch.datasets.TupleDataset(x_train, y_train),
+        batch_size=BATCH_SIZE, shuffle=True)
+    valid_iter = ch.iterators.SerialIterator(
+        ch.datasets.TupleDataset(x_valid, y_valid),
+        batch_size=BATCH_SIZE, shuffle=False, repeat=False)
+
+    optimizer = ch.optimizers.Adam()
+    optimizer.setup(classifier)
+    updater = ch.training.StandardUpdater(train_iter, optimizer, device=GPU_ID)
+    stop_trigger = ch.training.triggers.EarlyStoppingTrigger(
+        monitor='validation/main/loss', check_trigger=(100, 'epoch'),
+        max_trigger=(EPOCH, 'epoch'))
+
+    trainer = ch.training.Trainer(
+        updater, stop_trigger,
+        out=MODEL_DIRECTORY/f"model_{trial.number}")
+
+    log_report_extension = ch.training.extensions.LogReport(
+        trigger=(100, 'epoch'), log_name=None)
+    trainer.extend(log_report_extension)
+    trainer.extend(ch.training.extensions.PrintReport(
+        ['epoch', 'main/loss', 'validation/main/loss']))
+    trainer.extend(ch.training.extensions.snapshot(
+        filename='snapshot_epoch_{.updater.epoch}'))
+    trainer.extend(ch.training.extensions.Evaluator(valid_iter, classifier))
+    trainer.extend(ch.training.extensions.ProgressBar())
+    trainer.extend(
+        optuna.integration.ChainerPruningExtension(
+            trial, 'validation/main/loss', (PRUNER_INTERVAL, 'epoch')))
+
+    # Train
+    trainer.run()
+
+    loss = log_report_extension.log[-1]['validation/main/loss']
+    return loss
+
+
 def generate_model(trial):
     """Generate MLP model.
 
@@ -92,64 +150,6 @@ def generate_model(trial):
         model, lossfun=ch.functions.mean_squared_error)
     classifier.compute_accuracy = False
     return classifier
-
-
-def objective(trial):
-    """Objective function to make optimization for Optuna.
-
-    Args:
-        trial: optuna.trial.Trial
-    Returns:
-        loss: float
-            Loss value for the trial
-    """
-
-    # Generate model
-    classifier = generate_model(trial)
-
-    # Create dataset
-    x_train = np.load(DATASET_DIRECTORY / 'x_train.npy')
-    y_train = np.load(DATASET_DIRECTORY / 'y_train.npy')
-    x_valid = np.load(DATASET_DIRECTORY / 'x_valid.npy')
-    y_valid = np.load(DATASET_DIRECTORY / 'y_valid.npy')
-
-    # Prepare training
-    train_iter = ch.iterators.SerialIterator(
-        ch.datasets.TupleDataset(x_train, y_train),
-        batch_size=BATCH_SIZE, shuffle=True)
-    valid_iter = ch.iterators.SerialIterator(
-        ch.datasets.TupleDataset(x_valid, y_valid),
-        batch_size=BATCH_SIZE, shuffle=False, repeat=False)
-
-    optimizer = ch.optimizers.Adam()
-    optimizer.setup(classifier)
-    updater = ch.training.StandardUpdater(train_iter, optimizer, device=GPU_ID)
-
-    stop_trigger = ch.training.triggers.EarlyStoppingTrigger(
-        monitor='validation/main/loss', check_trigger=(100, 'epoch'),
-        max_trigger=(EPOCH, 'epoch'))
-
-    trainer = ch.training.Trainer(
-        updater, stop_trigger,
-        out=MODEL_DIRECTORY/f"model_{trial.number}")
-    log_report_extension = ch.training.extensions.LogReport(
-        trigger=(100, 'epoch'), log_name=None)
-    trainer.extend(log_report_extension)
-    trainer.extend(ch.training.extensions.PrintReport(
-        ['epoch', 'main/loss', 'validation/main/loss']))
-    trainer.extend(ch.training.extensions.snapshot(
-        filename='snapshot_epoch_{.updater.epoch}'))
-    trainer.extend(ch.training.extensions.Evaluator(valid_iter, classifier))
-    trainer.extend(ch.training.extensions.ProgressBar())
-    trainer.extend(
-        optuna.integration.ChainerPruningExtension(
-            trial, 'validation/main/loss', (PRUNER_INTERVAL, 'epoch')))
-
-    # Train
-    trainer.run()
-
-    loss = log_report_extension.log[-1]['validation/main/loss']
-    return loss
 
 
 class MLP(ch.ChainList):
@@ -238,10 +238,11 @@ def evaluate_results(trial):
         unit_numbers + [1], trial.params['activation_name'],
         trial.params['dropout_ratio'])
     snapshots = glob.glob(str(MODEL_DIRECTORY / f"model_{trial_number}" / '*'))
-    snapshot = max(snapshots, key=os.path.getctime)
-    print(f"Loading: {snapshot}")
+    latest_snapshot = max(
+        snapshots, key=os.path.getctime)  # The latest snapshot of the trial
+    print(f"Loading: {latest_snapshot}")
     ch.serializers.load_npz(
-        snapshot, model, path='updater/model:main/predictor/')
+        latest_snapshot, model, path='updater/model:main/predictor/')
 
     # Load data
     x_valid = np.load(DATASET_DIRECTORY / 'x_valid.npy')
