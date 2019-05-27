@@ -12,13 +12,9 @@ from sklearn.pipeline import make_pipeline
 # Optuna settings
 STUDY_NAME = 'poly'
 N_TRIALS = 10
-PRUNER_INTERVAL = 50
 
 # Machine learning settings
-EPOCH = 1000
 DATA_SIZE = 1000
-BATCH_SIZE = 100
-GPU_ID = -1  # Set value >= 0 to use GPU (-1: CPU mode)
 
 # Others
 DATASET_DIRECTORY = Path(f"./data/dataset_{DATA_SIZE}")
@@ -65,7 +61,7 @@ def objective(trial):
     Args:
         trial: optuna.trial.Trial
     Returns:
-        None
+        loss: float
     """
 
     # Suggest hyperparameters
@@ -80,7 +76,7 @@ def objective(trial):
     # Generate the model
     model = make_pipeline(PolynomialFeatures(polynomial_degree), Ridge())
 
-    # Create dataset
+    # Load dataset
     x_train = np.load(DATASET_DIRECTORY / 'x_train.npy')
     y_train = np.load(DATASET_DIRECTORY / 'y_train.npy')
     x_valid = np.load(DATASET_DIRECTORY / 'x_valid.npy')
@@ -94,7 +90,7 @@ def objective(trial):
         pickle.dump(model, f)
 
     # Evaluate loss
-    loss = np.mean((model.predict(x_valid) - y_valid)**2)**.5
+    loss = np.mean((model.predict(x_valid) - y_valid)**2)
     return loss
 
 
@@ -127,13 +123,13 @@ def evaluate_results(trial):
 def main():
     # Generate dataset
     prepare_dataset()
-    if not MODEL_DIRECTORY.exists():
-        MODEL_DIRECTORY.mkdir(parents=True)
 
     # Prepare study
+    if not MODEL_DIRECTORY.exists():
+        MODEL_DIRECTORY.mkdir(parents=True)
     study = optuna.create_study(
         study_name=STUDY_NAME, storage=f"sqlite:///{STUDY_NAME}.db",
-        load_if_exists=True, pruner=optuna.pruners.MedianPruner())
+        load_if_exists=True)
 
     # Optimize
     study.optimize(objective, n_trials=N_TRIALS)

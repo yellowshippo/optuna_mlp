@@ -1,3 +1,5 @@
+import glob
+import os
 from pathlib import Path
 
 import chainer as ch
@@ -7,11 +9,12 @@ import optuna
 
 
 # Optuna settings
+STUDY_NAME = 'mlp'
 N_TRIALS = 100
-PRUNER_INTERVAL = 50
+PRUNER_INTERVAL = 100
 
 # Machine learning settings
-EPOCH = 1000
+EPOCH = 5000
 DATA_SIZE = 1000
 BATCH_SIZE = 100
 GPU_ID = -1  # Set value >= 0 to use GPU (-1: CPU mode)
@@ -55,15 +58,14 @@ def prepare_dataset():
         np.save(DATASET_DIRECTORY / 'y_valid.npy', y_valid)
 
 
-def objective(trial):
-    """Objective function to make optimization for Optuna.
+def generate_model(trial):
+    """Generate MLP model.
 
     Args:
         trial: optuna.trial.Trial
     Returns:
-        None
+        classifier: chainer.links.Classifier
     """
-
     # Suggest hyperparameters
     layer_number = trial.suggest_int('layer_number', 2, 5)
     activation_name = trial.suggest_categorical(
@@ -71,7 +73,7 @@ def objective(trial):
     unit_numbers = [
         trial.suggest_int(f"unit_number_layer{i}", 10, 100)
         for i in range(layer_number - 1)] + [1]
-    dropout_ratio = trial.suggest_uniform('dropout_ratio', 0.1, 0.9)
+    dropout_ratio = trial.suggest_uniform('dropout_ratio', 0.0, 0.2)
 
     print('--')
     print(f"Trial: {trial.number}")
@@ -86,7 +88,24 @@ def objective(trial):
     model = MLP(
         unit_numbers, activation_name=activation_name,
         dropout_ratio=dropout_ratio)
-    classifier = Classifier(model)
+    classifier = ch.links.Classifier(
+        model, lossfun=ch.functions.mean_squared_error)
+    classifier.compute_accuracy = False
+    return classifier
+
+
+def objective(trial):
+    """Objective function to make optimization for Optuna.
+
+    Args:
+        trial: optuna.trial.Trial
+    Returns:
+        loss: float
+            Loss value for the trial
+    """
+
+    # Generate model
+    classifier = generate_model(trial)
 
     # Create dataset
     x_train = np.load(DATASET_DIRECTORY / 'x_train.npy')
@@ -106,8 +125,12 @@ def objective(trial):
     optimizer.setup(classifier)
     updater = ch.training.StandardUpdater(train_iter, optimizer, device=GPU_ID)
 
+    stop_trigger = ch.training.triggers.EarlyStoppingTrigger(
+        monitor='validation/main/loss', check_trigger=(100, 'epoch'),
+        max_trigger=(EPOCH, 'epoch'))
+
     trainer = ch.training.Trainer(
-        updater, (EPOCH, 'epoch'),
+        updater, stop_trigger,
         out=MODEL_DIRECTORY/f"model_{trial.number}")
     log_report_extension = ch.training.extensions.LogReport(
         trigger=(100, 'epoch'), log_name=None)
@@ -118,7 +141,6 @@ def objective(trial):
         filename='snapshot_epoch_{.updater.epoch}'))
     trainer.extend(ch.training.extensions.Evaluator(valid_iter, classifier))
     trainer.extend(ch.training.extensions.ProgressBar())
-
     trainer.extend(
         optuna.integration.ChainerPruningExtension(
             trial, 'validation/main/loss', (PRUNER_INTERVAL, 'epoch')))
@@ -130,26 +152,11 @@ def objective(trial):
     return loss
 
 
-class Classifier(ch.Chain):
-
-    def __init__(self, predictor):
-        super().__init__()
-        with self.init_scope():
-            self.predictor = predictor
-
-    def __call__(self, x, t):
-        y = self.predictor(x)
-        loss = ch.functions.mean_squared_error(y, t)
-        ch.report({'loss': loss}, self)
-        return loss
-
-
 class MLP(ch.ChainList):
     """Multi Layer Perceptron."""
 
     def __init__(
-            self, unit_numbers=[10, 10, 1], activation_name='relu',
-            dropout_ratio=.5):
+            self, unit_numbers, activation_name, dropout_ratio):
         """Initialize MLP object.
 
         Args:
@@ -199,14 +206,15 @@ class MLP(ch.ChainList):
             x: numpy.ndarray or cupy.ndarray
                 Input of the NN.
         Returns:
-            y: numpy.ndarray of cupy.ndarray
+            y: numpy.ndarray or cupy.ndarray
                 Output of the NN.
         """
         h = x
-        for link, activation in zip(self, self.activations):
+        for i, link in enumerate(self):
             h = link(h)
-            # h = ch.functions.dropout(h, ratio=self.dropout_ratio)
-            h = activation(h)
+            if i + 1 != len(self):
+                h = ch.functions.dropout(h, ratio=self.dropout_ratio)
+            h = self.activations[i](h)
         return h
 
 
@@ -218,7 +226,6 @@ def evaluate_results(trial):
     Returns:
         None
     """
-
     # Load model
     trial_number = trial.number
     unit_numbers = []
@@ -230,9 +237,11 @@ def evaluate_results(trial):
     model = MLP(
         unit_numbers + [1], trial.params['activation_name'],
         trial.params['dropout_ratio'])
+    snapshots = glob.glob(str(MODEL_DIRECTORY / f"model_{trial_number}" / '*'))
+    snapshot = max(snapshots, key=os.path.getctime)
+    print(f"Loading: {snapshot}")
     ch.serializers.load_npz(
-        MODEL_DIRECTORY / f"model_{trial_number}/snapshot_epoch_{EPOCH - 1}",
-        model, path='updater/model:main/predictor/')
+        snapshot, model, path='updater/model:main/predictor/')
 
     # Load data
     x_valid = np.load(DATASET_DIRECTORY / 'x_valid.npy')
@@ -240,7 +249,9 @@ def evaluate_results(trial):
 
     # Plot
     plt.plot(x_valid, y_valid, '.', label='answer')
-    plt.plot(x_valid, model(x_valid).data, '.', label='prediction')
+    with ch.using_config('train', False):
+        predict = model(x_valid).data
+    plt.plot(x_valid, predict, '.', label='prediction')
     plt.legend()
     plt.show()
 
@@ -251,7 +262,7 @@ def main():
 
     # Prepare study
     study = optuna.create_study(
-        study_name='mlp', storage='sqlite:///mlp.db',
+        study_name=STUDY_NAME, storage=f"sqlite:///{STUDY_NAME}.db",
         load_if_exists=True, pruner=optuna.pruners.MedianPruner())
 
     # Optimize
